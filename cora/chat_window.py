@@ -1,15 +1,15 @@
 import sys
 import threading
 import os
+import shutil
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QPixmap, QAction
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
+from PyQt6.QtGui import QFont, QAction, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QHBoxLayout,
-    QLabel, QTextEdit, QPushButton,
-    QScrollArea, QFrame, QFileDialog,
-    QMenu
+    QVBoxLayout, QHBoxLayout, QLabel,
+    QTextEdit, QPushButton, QListWidget, QFrame,
+    QFileDialog, QMenu, QMessageBox
 )
 
 try:
@@ -17,534 +17,452 @@ try:
 except ImportError:
     sr = None
 
-AGENT_ICON = "cora.webp"
+# -----------------------------
+# Voice Worker (QThread)
+# -----------------------------
+class VoiceWorker(QThread):
+    text_ready = pyqtSignal(str)
+    finished = pyqtSignal()
+    
+    def __init__(self, recognizer):
+        super().__init__()
+        self.recognizer = recognizer
+        self.running = False
 
+    def run(self):
+        self.running = True
+        print("VoiceWorker: Started.")
+        try:
+            with sr.Microphone() as source:
+                print("VoiceWorker: Adjusting ambient noise...")
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                
+                while self.running:
+                    print("VoiceWorker: Listening Loop...")
+                    try:
+                        # Listen for short phrases
+                        audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
+                        print("VoiceWorker: Capturing...")
+                        text = self.recognizer.recognize_google(audio)
+                        print(f"VoiceWorker Result: {text}")
+                        if text:
+                            self.text_ready.emit(text)
+                    except sr.WaitTimeoutError:
+                        continue # Loop again
+                    except sr.UnknownValueError:
+                        print("VoiceWorker: Unintelligible")
+                        continue
+                    except Exception as e:
+                        print(f"VoiceWorker Error: {e}")
+                        break
+        except Exception as e:
+            print(f"VoiceWorker Init Error: {e}")
+        finally:
+            print("VoiceWorker: Finished.")
+            self.finished.emit()
 
+    def stop(self):
+        self.running = False
+
+# -----------------------------
+# Custom Input Field (Enter to Send)
+# -----------------------------
+class ChatInput(QTextEdit):
+    return_pressed = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Return and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            self.return_pressed.emit()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+# -----------------------------
+# Main UI
+# -----------------------------
 class ChatWindow(QMainWindow):
-    send_message_signal = pyqtSignal(str)
-    ai_response_signal = pyqtSignal(str)
-    stream_token_signal = pyqtSignal(str)
-    stream_finished_signal = pyqtSignal()
-    stop_signal = pyqtSignal()
+    # ... (Signals omitted for brevity, they remain same) ...
+    send_message_signal = pyqtSignal(str, object) 
+    ai_response_signal = pyqtSignal(str) 
+    stream_token_signal = pyqtSignal(str) 
+    stream_finished_signal = pyqtSignal() 
+    stop_signal = pyqtSignal() 
 
     def __init__(self):
         super().__init__()
-        self.listening = False
+        # ... (init code remains same) ...
+        self.setWindowTitle("CORA · AI Assistant")
+        self.resize(1000, 600)
+        self.setWindowIcon(QIcon("icons/chatbot_icon.png"))
+
+        # State
+        self.chat_history = {}
+        self.current_chat = "New Chat"
+        self.last_prompt = ""
+        self.current_attachment = None
         self.recognizer = sr.Recognizer() if sr else None
+        
+        self.voice_thread = None
 
+        self.apply_theme()
         self.init_ui()
-        self.stream_token_signal.connect(self.append_stream_token)
-        self.ai_response_signal.connect(self.add_ai_message)
-        self.stream_finished_signal.connect(self.on_stream_finished)
 
-    # ---------------- UI ---------------- #
+        # Connect Signals
+        self.ai_response_signal.connect(self.on_ai_response_start)
+        self.stream_token_signal.connect(self.stream_response)
+        self.stream_finished_signal.connect(self.finish_response)
+
+    # ... (apply_theme remains same) ...
 
     def init_ui(self):
-        self.setWindowTitle("CORA · Contextual Observer")
-        self.resize(480, 720)
+        # ... (Layout setup remains same until input_field) ...
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        self.setStyleSheet("""
-        QMainWindow {
-            background: #0b0f14;
-        }
-        QScrollBar:vertical {
-            width: 6px;
-            background: transparent;
-        }
-        QScrollBar::handle:vertical {
-            background: #1f2937;
-            border-radius: 3px;
-        }
-        """)
-
-        root = QWidget()
-        self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(14)
-
-        self.create_header(layout)
-        self.create_chat_area(layout)
-        self.create_input_bar(layout)
-
-        self.add_ai("Cora is online. I’m observing and ready.")
-
-    def create_header(self, parent):
-        bar = QFrame()
-        bar.setFixedHeight(60)
-        bar.setStyleSheet("""
-        QFrame {
-            background: #0f172a;
-            border-radius: 16px;
-            border: 1px solid #1f2937;
-        }
-        """)
-
-        h = QHBoxLayout(bar)
-        h.setContentsMargins(18, 10, 18, 10)
-
-        title = QLabel("CORA")
-        title.setStyleSheet("""
-        QLabel {
-            color: #e5e7eb;
-            font-size: 18px;
-            font-weight: 600;
-            letter-spacing: 0.5px;
-        }
-        """)
-
-        status = QLabel("● Active")
-        status.setStyleSheet("""
-        QLabel {
-            color: #22c55e;
-            font-size: 12px;
-        }
-        """)
-
-        h.addWidget(title)
-        h.addWidget(status)
-        h.addStretch()
-
-        parent.addWidget(bar)
-
-    def create_chat_area(self, parent):
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setStyleSheet("QScrollArea { border: none; }")
-
-        self.chat_widget = QWidget()
-        self.chat_layout = QVBoxLayout(self.chat_widget)
-        self.chat_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.chat_layout.setSpacing(14)
-
-        self.scroll.setWidget(self.chat_widget)
-        parent.addWidget(self.scroll, 1)
-
-    def create_input_bar(self, parent):
-        bar = QFrame()
-        bar.setStyleSheet("""
-        QFrame {
-            background: #0f172a;
-            border-radius: 20px;
-            border: 1px solid #1f2937;
-        }
-        """)
-
-        h = QHBoxLayout(bar)
-        h.setContentsMargins(14, 12, 14, 12)
-        h.setSpacing(10)
-
-        self.input = QTextEdit()
-        self.input.setPlaceholderText("Message Cora…")
-        self.input.setMaximumHeight(80)
-        self.input.setStyleSheet("""
-        QTextEdit {
-            background: transparent;
-            border: none;
-            color: #e5e7eb;
-            font-size: 14px;
-            padding: 6px;
-        }
-        QTextEdit::placeholder {
-            color: #6b7280;
-        }
-        """)
-        self.input.textChanged.connect(self.update_send_button_state)
-
-        attach = QPushButton("📎")
-        attach.clicked.connect(self.attach_file)
-        attach.setStyleSheet(self.icon_btn_style())
-
-        self.mic = QPushButton("🎤")
-        self.mic.clicked.connect(self.toggle_voice)
-        self.mic.setStyleSheet(self.icon_btn_style())
-
-        self.send = QPushButton("➤")
-        # Initialize disabled
-        self.send.setEnabled(False) 
-        self.send.clicked.connect(self.on_send_click)
-        self.send.setStyleSheet("""
-        QPushButton {
-            background: #2563eb;
-            border-radius: 14px;
-            padding: 8px 16px;
-            color: white;
-            font-size: 14px;
-        }
-        QPushButton:hover {
-            background: #3b82f6;
-        }
-        QPushButton:disabled {
-            background: #1e293b;
-            color: #64748b;
-        }
-        """)
-
-        h.addWidget(self.input, 1)
-        h.addWidget(attach)
-        h.addWidget(self.mic)
-        h.addWidget(self.send)
-
-        parent.addWidget(bar)
+        # Sidebar
+        self.sidebar = QListWidget()
+        self.sidebar.setFixedWidth(240)
+        self.sidebar.addItem(self.current_chat)
+        self.sidebar.setCurrentRow(0)
         
-        self.is_generating = False
+        sidebar_container = QWidget()
+        sidebar_layout = QVBoxLayout(sidebar_container)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.addWidget(self.sidebar)
+        main_layout.addWidget(sidebar_container)
 
+        # Chat Area
+        chat_container = QWidget()
+        chat_layout = QVBoxLayout(chat_container)
+        chat_layout.setContentsMargins(20, 20, 20, 20)
+        chat_layout.setSpacing(16)
+
+        header = QLabel("Cora Assistant")
+        header.setStyleSheet("font-size: 18px; font-weight: bold; color: #fff;")
+        chat_layout.addWidget(header)
+
+        self.chat_display = QTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setStyleSheet("border: none; background: transparent; font-size: 15px;")
+        chat_layout.addWidget(self.chat_display)
+
+        # Input Wrapper
+        input_area_wrapper = QWidget()
+        input_area_layout = QVBoxLayout(input_area_wrapper)
+        input_area_layout.setContentsMargins(0, 0, 0, 0)
+        input_area_layout.setSpacing(4)
+
+        # Chip
+        self.chip_container = QWidget()
+        self.chip_container.setVisible(False) 
+        self.chip_container.setStyleSheet("""
+            QWidget {
+                background-color: #1f2937;
+                border-radius: 12px;
+                border: 1px solid #374151;
+            }
+        """)
+        chip_layout = QHBoxLayout(self.chip_container)
+        chip_layout.setContentsMargins(12, 4, 12, 4)
+        
+        self.chip_label = QLabel("File.pdf")
+        self.chip_label.setStyleSheet("color: #e5e7eb; font-size: 12px; border: none; background: transparent;")
+        
+        close_chip = QPushButton("✕")
+        close_chip.setFixedSize(20, 20)
+        close_chip.setStyleSheet("""
+            QPushButton {
+                background: transparent; border: none; color: #9ca3af; font-weight: bold;
+            }
+            QPushButton:hover { color: #ef4444; background: transparent; }
+        """)
+        close_chip.clicked.connect(self.remove_attachment)
+
+        chip_layout.addWidget(QLabel("📎")) 
+        chip_layout.addWidget(self.chip_label)
+        chip_layout.addStretch()
+        chip_layout.addWidget(close_chip)
+        
+        chip_wrapper = QHBoxLayout()
+        chip_wrapper.setContentsMargins(10, 0, 0, 0)
+        chip_wrapper.addWidget(self.chip_container)
+        chip_wrapper.addStretch()
+        
+        input_area_layout.addLayout(chip_wrapper)
+
+        # Input Frame (Pill)
+        input_frame = QFrame()
+        input_frame.setFixedHeight(54) 
+        input_frame.setStyleSheet("""
+            QFrame {
+                background-color: #374151;
+                border-radius: 27px;
+                border: 1px solid #4b5563;
+            }
+        """)
+        input_layout = QHBoxLayout(input_frame)
+        input_layout.setContentsMargins(10, 5, 10, 5) 
+        input_layout.setSpacing(10)
+
+        # Attach
+        self.attach_btn = QPushButton("+")
+        self.attach_btn.setFixedSize(36, 36)
+        self.attach_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: 2px solid #9ca3af;
+                border-radius: 18px;
+                color: #9ca3af;
+                font-size: 20px;
+                font-weight: bold;
+                padding-bottom: 2px;
+            }
+            QPushButton:hover { color: #fff; border-color: #fff; background: rgba(255,255,255,0.1); }
+        """)
+        self.attach_btn.clicked.connect(self.attach_file)
+
+        # Input Field (CUSTOM CLASS)
+        self.input_field = ChatInput() # Using ChatInput
+        self.input_field.setPlaceholderText("Ask anything...")
+        self.input_field.setFixedHeight(34) 
+        self.input_field.setStyleSheet("""
+            QTextEdit {
+                background: transparent;
+                border: none;
+                padding-top: 6px;
+                color: white;
+                font-size: 15px;
+            }
+        """)
+        self.input_field.return_pressed.connect(self.send_message) # Connect Enter Key
+
+        # Mic
+        self.mic_btn = QPushButton("")
+        self.mic_btn.setFixedSize(36, 36)
+        self.mic_btn.setIcon(QIcon("icons/mic.png"))
+        self.mic_btn.setIconSize(self.mic_btn.size() * 0.6)
+        self.mic_btn.setStyleSheet(self.icon_btn_style())
+        self.mic_btn.clicked.connect(self.toggle_voice)
+
+        # Send
+        self.send_btn = QPushButton("➤") 
+        self.send_btn.setFixedSize(40, 40)
+        self.send_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6; 
+                color: white;
+                border-radius: 20px;
+                border: none;
+                font-size: 16px;
+                padding-left: 2px; 
+            }
+            QPushButton:hover { background-color: #2563eb; }
+        """)
+        self.send_btn.clicked.connect(self.send_message)
+
+        # Stop
+        self.stop_btn = QPushButton("⏹")
+        self.stop_btn.setFixedSize(40, 40)
+        self.stop_btn.setVisible(False)
+        self.stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ef4444;
+                color: white;
+                border-radius: 20px;
+                border: none;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #dc2626; }
+        """)
+        self.stop_btn.clicked.connect(self.stop_generation)
+
+        input_layout.addWidget(self.attach_btn)
+        input_layout.addWidget(self.input_field, 1) 
+        input_layout.addWidget(self.mic_btn) 
+        input_layout.addWidget(self.send_btn)
+        input_layout.addWidget(self.stop_btn)
+        
+        input_area_layout.addWidget(input_frame)
+
+        chat_layout.addWidget(input_area_wrapper)
+        main_layout.addWidget(chat_container, 1)
+
+    # ---------------- Styles ----------------
     def icon_btn_style(self):
         return """
         QPushButton {
             background: transparent;
-            color: #9ca3af;
-            font-size: 16px;
             border: none;
-            padding: 6px;
+            color: #9ca3af;
         }
-        QPushButton:hover {
-            color: #e5e7eb;
-        }
+        QPushButton:hover { color: #fff; background: rgba(255,255,255,0.1); border-radius: 18px; }
         """
 
-    def update_send_button_state(self):
-        # Only enable if text exists AND we are not generating (or if generating, it's always enabled as Stop)
-        if self.is_generating:
-            self.send.setEnabled(True)
-        else:
-            has_text = bool(self.input.toPlainText().strip())
-            self.send.setEnabled(has_text)
+    def primary_btn_style(self):
+        # Unused in new design but kept for ref or safe removal
+        return ""
 
-    def on_send_click(self):
-        if self.is_generating:
-            # Stop action
-            self.stop_signal.emit()
-            # We don't immediately toggle back, wait for backend to confirm stop or just toggle UI?
-            # For responsiveness, toggle UI now.
-            self.set_generating_state(False)
-            self.add_ai("Stopped.")
-        else:
-            self.on_send()
-
-    def set_generating_state(self, is_generating):
-        self.is_generating = is_generating
-        if is_generating:
-            self.send.setText("⏹") # Stop icon
-            self.send.setEnabled(True)
-            self.send.setStyleSheet("""
-            QPushButton {
-                background: #dc2626;
-                border-radius: 14px;
-                padding: 8px 16px;
-                color: white;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background: #ef4444;
-            }
-            """)
-        else:
-            self.send.setText("➤")
-            self.send.setStyleSheet("""
-            QPushButton {
-                background: #2563eb;
-                border-radius: 14px;
-                padding: 8px 16px;
-                color: white;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background: #3b82f6;
-            }
-            QPushButton:disabled {
-                background: #1e293b;
-                color: #64748b;
-            }
-            """)
-            self.update_send_button_state()
-
-    # ---------------- Chat Bubbles ---------------- #
-
-    def bubble(self, text, role, attachment=None):
-        row = QHBoxLayout()
-
-        bg = "#2563eb" if role == "user" else "#020617"
-        # Role-based border
-        border = "#1d4ed8" if role == "user" else "#1f2937"
-
-        frame = QFrame()
-        frame.setStyleSheet(f"""
-        QFrame {{
-            background: {bg};
+    def danger_btn_style(self):
+        return ""
+        
+    def recording_style(self):
+        return """
+        QPushButton {
+            background-color: rgba(220, 38, 38, 0.2);
             border-radius: 18px;
-            border: 1px solid {border};
-            padding: 8px 12px;
-        }}
-        """)
-        
-        # Context Menu
-        frame.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        frame.customContextMenuRequested.connect(lambda pos: self.show_context_menu(pos, frame, role, text))
-
-        v = QVBoxLayout(frame)
-        v.setSpacing(4)
-        v.setContentsMargins(0, 0, 0, 0)
-
-        if role == "ai" and os.path.exists(AGENT_ICON):
-            icon = QLabel()
-            pix = QPixmap(AGENT_ICON).scaled(24, 24, Qt.AspectRatioMode.KeepAspectRatio)
-            icon.setPixmap(pix)
-            # icon.setStyleSheet("border: none; background: transparent;") # basic clean
-            v.addWidget(icon)
-
-        msg = QLabel(text)
-        msg.setWordWrap(True)
-        msg.setStyleSheet("""
-        QLabel {
-            color: #e5e7eb;
-            font-size: 14px;
-            line-height: 1.4;
-            background: transparent;
-            border: none;
+            border: 1px solid #dc2626;
         }
-        """)
-        msg.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        v.addWidget(msg)
+        QPushButton:hover { background-color: rgba(220, 38, 38, 0.4); }
+        """
 
+    # ---------------- Interactions ----------------
+
+    def send_message(self):
+        prompt = self.input_field.toPlainText().strip()
+        attachment = self.current_attachment
+        
+        if not prompt and not attachment:
+            return
+
+        # Auto-stop listening when sending
+        if self.voice_thread and self.voice_thread.isRunning():
+            self.stop_listening()
+
+        if not prompt and attachment:
+             prompt = f"Analyze this file: {os.path.basename(attachment)}"
+
+        self.last_prompt = prompt
+        
+        self.append_chat_message("You", prompt, is_user=True)
         if attachment:
-            att = QLabel(f"📎 {os.path.basename(attachment)}")
-            att.setStyleSheet("""
-            QLabel {
-                color: #93c5fd;
-                font-size: 12px;
-                background: transparent;
-                border: none;
-            }
-            """)
-            v.addWidget(att)
+             self.chat_display.append(f"<i style='color:#9ca3af'>[Attached: {os.path.basename(attachment)}]</i>")
 
-        if role == "user":
-            row.addStretch()
-            row.addWidget(frame)
-        else:
-            row.addWidget(frame)
-            row.addStretch()
+        self.input_field.clear()
+        self.remove_attachment() # Clear UI and state
+        
+        self.send_btn.setVisible(False)
+        self.stop_btn.setVisible(True)
 
-        container = QWidget()
-        container.setLayout(row)
-        self.chat_layout.addWidget(container)
+        self.send_message_signal.emit(prompt, attachment)
 
-        QTimer.singleShot(50, self.scroll_to_bottom)
+    def stop_generation(self):
+        self.stop_signal.emit()
+        self.finish_response()
 
-    def show_context_menu(self, pos, widget, role, text):
-        menu = QMenu()
-        menu.setStyleSheet("""
-        QMenu {
-            background-color: #1f2937;
-            color: white;
-            border: 1px solid #374151;
-        }
-        QMenu::item:selected {
-            background-color: #374151;
-        }
-        """)
-        
-        if role == "user":
-            edit_action = QAction("Edit", self)
-            edit_action.triggered.connect(lambda: self.edit_message(text))
-            menu.addAction(edit_action)
-        elif role == "ai":
-            regen_action = QAction("Regenerate", self)
-            regen_action.triggered.connect(self.regenerate_last_user_message)
-            menu.addAction(regen_action)
-            
-        copy_action = QAction("Copy", self)
-        copy_action.triggered.connect(lambda: QApplication.clipboard().setText(text))
-        menu.addAction(copy_action)
-        
-        menu.exec(widget.mapToGlobal(pos))
+    # ---------------- AI Integration Slots ----------------
 
-    def edit_message(self, original_text):
-        # Simpler: Just prompt to send corrected message. 
-        # Truly editing past history is complex in this architecture without ID tracking.
-        # We will treat "Edit" as "Copy to input, let user fix, and send new".
-        
-        # 1. Put text in input
-        self.input.setText(original_text)
-        self.input.setFocus()
-        self.update_send_button_state()
-        
-        # Optional: Ask user if they want to 'edit' (which effectively means resending)
-        # For now, just placing it in input is a good "Edit" workflow for a simple chat app.
-        
-    def regenerate_last_user_message(self):
-        # We need to find the last user message text.
-        # This is a bit hacky without a message model list, but we can iterate the layout.
-        
-        last_user_text = ""
-        # Iterate backwards
-        count = self.chat_layout.count()
-        
-        # Retrieval from UI:
-        for i in range(count - 1, -1, -1):
-            container = self.chat_layout.itemAt(i).widget()
-            if not container: continue
-            layout = container.layout()
-            if not layout: continue
-            
-            # Check alignment: User messages have spacer at start (index 0 is stretch)
-            # Actually: user layout is [Stretch, Frame]. AI is [Frame, Stretch].
-            
-            # Check if User
-            if layout.count() > 0:
-                first_item = layout.itemAt(0)
-                if first_item and first_item.spacerItem(): # It's a spacer -> User message
-                    # Frame is at index 1
-                    frame = layout.itemAt(1).widget()
-                    if frame:
-                        # Find Label
-                        labels = frame.findChildren(QLabel)
-                        for lbl in labels:
-                            if lbl.wordWrap(): # It's the message body
-                                last_user_text = lbl.text()
-                                break
-                    if last_user_text:
-                        break
-        
-        if last_user_text:
-            self.on_send(text=last_user_text) # Re-send custom method
-            
-    def add_user(self, text, attachment=None):
-        self.bubble(text, "user", attachment)
+    def on_ai_response_start(self, text):
+        self.chat_display.append(f"<br><b><span style='color:#60a5fa'>Cora</span></b><br>")
+        if text:
+            self.stream_response(text)
 
-    def add_ai(self, text):
-        self.bubble(text, "ai")
-        # Legacy: If we get text, it's usually a full message OR start of stream. 
-        # But main.py now handles stream finishing.
-        # If text is not empty and not "Stopped.", maybe keep generating state?
-        # Actually, for "Stopped." we manually set state in on_send_click.
+    def stream_response(self, text):
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertText(text)
+        self.chat_display.setTextCursor(cursor)
+        sb = self.chat_display.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def finish_response(self):
+        self.send_btn.setVisible(True)
+        self.stop_btn.setVisible(False)
+        self.chat_display.append("<br>")
+        self.add_regenerate_button()
+
+    def append_chat_message(self, sender, text, is_user=False):
+        color = "#e5e7eb" if not is_user else "#93c5fd" 
+        html = f"<div style='margin-top: 10px;'><b><span style='color:{color}'>{sender}</span></b><br>{text}</div>"
+        self.chat_display.append(html)
+
+    # ---------------- Regenerate (Stub) ----------------
+    def add_regenerate_button(self):
+        # We can add a clickable link or small button in the text flow?
+        # Or just rely on the user re-typing/sidebar usage.
+        # For simplicity with main.py, we avoid complex regeneration logic right now.
         pass
 
-    def on_stream_finished(self):
-        self.set_generating_state(False)
-        self.enable_input() # Redundant but safe
-        self.input.setFocus()
-
-    def on_send(self, text=None):
-        if not text:
-            text = self.input.toPlainText().strip()
-            
-        if not text:
-            # Should be disabled, but double check
-            return
-
-        self.input.clear()
-        self.disable_input()
-        self.stop_listening()
-        self.set_generating_state(True) # Start generating state
-
-        self.add_user(text)
-        self.send_message_signal.emit(text)
-
+    # ---------------- Attach File ----------------
     def attach_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Attach File")
-        if path:
-            self.add_user("Attached a file", attachment=path)
+        file_path, _ = QFileDialog.getOpenFileName(self, "Attach File")
+        if file_path:
+            self.set_attachment(file_path)
 
+    def set_attachment(self, path):
+        self.current_attachment = path
+        filename = os.path.basename(path)
+        self.chip_label.setText(filename)
+        self.chip_container.setVisible(True)
+        self.input_field.setFocus()
+
+    def remove_attachment(self):
+        self.current_attachment = None
+        self.chip_container.setVisible(False)
+
+    # ---------------- Voice Input ----------------
     def toggle_voice(self):
         if not self.recognizer:
-            self.input.setPlaceholderText("Voice unavailable")
+            QMessageBox.information(self, "Voice Error", "Speech Recognition not installed.")
             return
 
-        if self.listening:
+        if self.voice_thread and self.voice_thread.isRunning():
             self.stop_listening()
         else:
             self.start_listening()
 
     def start_listening(self):
-        self.listening = True
-        self.mic.setText("⏹")
-        threading.Thread(target=self.listen_voice, daemon=True).start()
+        self.mic_btn.setStyleSheet(self.recording_style())
+        self.voice_thread = VoiceWorker(self.recognizer)
+        self.voice_thread.text_ready.connect(self.append_voice_text)
+        self.voice_thread.finished.connect(self.on_voice_finished)
+        self.voice_thread.start()
 
     def stop_listening(self):
-        self.listening = False
-        self.mic.setText("🎤")
+        if self.voice_thread:
+            self.voice_thread.stop()
+            # Thread will finish and trigger on_voice_finished
+    
+    def on_voice_finished(self):
+        self.mic_btn.setStyleSheet(self.icon_btn_style())
+        self.input_field.setFocus()
 
-    def listen_voice(self):
-        if not self.recognizer or not sr:
-             print("Voice Error: SpeechRecognition not initialized.")
-             return
-        try:
-            print("Listening for voice...")
-            with sr.Microphone() as source:
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                # Reduced timeout to fail faster if no audio
-                audio = self.recognizer.listen(source, timeout=7, phrase_time_limit=10)
-                print("Voice captured. Recognizing...")
-                text = self.recognizer.recognize_google(audio)
-                print(f"Recognized: {text}")
-                
-                # We need to emit or use QTimer to update UI on main thread
-                # USING partial or default arg to bind 'text' value safely
-                QTimer.singleShot(0, lambda t=text: self.process_voice_result(t))
-        except sr.WaitTimeoutError:
-            print("Voice Timeout: No speech detected.")
-            QTimer.singleShot(0, lambda: self.input.setPlaceholderText("No speech detected. Try again."))
-        except sr.UnknownValueError:
-            print("Voice Error: Could not understand audio.")
-            QTimer.singleShot(0, lambda: self.input.setPlaceholderText("Could not understand. Try again."))
-        except Exception as e:
-            print(f"Voice Error: {e}")
-            QTimer.singleShot(0, lambda: self.input.setPlaceholderText(f"Error: {str(e)[:20]}..."))
-        finally:
-            QTimer.singleShot(0, self.stop_listening)
-
-    def process_voice_result(self, text):
-        print(f"DEBUG: Processing voice result: {text}")
-        self.input.setText(text)
-        # Force process events or just call send. 
-        # Since this is running in QTimer (Main Thread), it should be fine.
-        # Check if text was set
-        if self.input.toPlainText().strip() == text:
-             self.on_send()
+    def append_voice_text(self, text):
+        # "Live" update - append to existing text
+        current = self.input_field.toPlainText()
+        if current:
+            new_text = current + " " + text
         else:
-             print("DEBUG: Input mismatch. Forcing send with arg.")
-             # Fallback if on_send relies strictly on UI state which might lag? 
-             # No, standard PyQt logic says setText updates model immediately.
-             self.on_send()
+            new_text = text
+        self.input_field.setText(new_text)
+        
+        # Move cursor to end
+        cursor = self.input_field.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.input_field.setTextCursor(cursor)
 
-    def disable_input(self):
-        self.input.setDisabled(True)
-        self.send.setDisabled(True)
+    # ---------------- Compatibility ----------------
+    def add_user(self, text, attachment=None):
+        self.append_chat_message("You", text, is_user=True)
+        if attachment:
+            self.chat_display.append(f"<i style='color:#9ca3af'>[Attached: {os.path.basename(attachment)}]</i>")
 
-    def enable_input(self):
-        self.input.setDisabled(False)
-        self.send.setDisabled(False)
+    def add_ai(self, text):
+        # Non-streaming add
+        self.on_ai_response_start("")
+        self.stream_response(text)
+        self.finish_response()
 
-    def scroll_to_bottom(self):
-        self.scroll.verticalScrollBar().setValue(
-            self.scroll.verticalScrollBar().maximum()
-        )
-
-    # --- Compatibility ---
-    def add_ai_message(self, text):
-        self.add_ai(text)
-
-    def append_stream_token(self, token):
-        count = self.chat_layout.count()
-        if count == 0:
-            return
-
-        container = self.chat_layout.itemAt(count - 1).widget()
-        if not container:
-            return
-
-        labels = container.findChildren(QLabel)
-        for lbl in labels:
-            if lbl.wordWrap():
-                lbl.setText(lbl.text() + token)
-                self.scroll_to_bottom()
-                break
-
+    # ---------------- Chat History Stub ----------------
+    def load_chat(self):
+        # Placeholder for future history loading
+        pass
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = ChatWindow()
     win.show()
     sys.exit(app.exec())
+

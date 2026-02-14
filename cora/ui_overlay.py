@@ -36,28 +36,19 @@ class FloatingIcon(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
-        # Draw Circle Background (Centered in 0-60 space, offset for button)
-        # Circle size 46
-        # Pos: x=7, y=10
-        path = QPainterPath()
-        path.addEllipse(7, 10, 46, 46)
-        painter.fillPath(path, QColor("#ffffff"))
+        # Load icon - fallback if not found
+        icon_path = "icon.png"
+        icon = QPixmap(icon_path)
         
-        # Draw Border
-        painter.setPen(QColor("#e0e0e0"))
-        painter.drawEllipse(7, 10, 46, 46)
-
-        # Draw Icon (Cora Green)
-        icon = QPixmap("icon.png")
         if not icon.isNull():
-            # Target inside circle
-            target_rect = QRect(17, 20, 26, 26)
-            painter.drawPixmap(target_rect, icon)
+            # Draw the Icon filling the entire widget (60x60)
+            painter.drawPixmap(self.rect(), icon)
         else:
             # Fallback
             painter.setPen(QColor("#0078d4"))
-            painter.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-            painter.drawText(QRect(7, 10, 46, 46), Qt.AlignmentFlag.AlignCenter, "C")
+            painter.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Cora")
+
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -194,7 +185,7 @@ class SuggestionMenu(QWidget):
             self.actions_layout.addWidget(btn)
 
 class ProactiveBubble(QWidget):
-    ask_cora_clicked = pyqtSignal(str) # Emits query
+    ask_cora_clicked = pyqtSignal(str, str) # Emits (UserVisibleText, InternalPrompt)
     
     def __init__(self):
         super().__init__()
@@ -252,5 +243,5 @@ class ProactiveBubble(QWidget):
             f"Look strictly at the part of the screen relevant to the Reason. "
             f"Provide the solution or fix immediately. Do not describe the rest of the screen."
         )
-        self.ask_cora_clicked.emit(query)
+        self.ask_cora_clicked.emit(action_text, query)
         self.menu_widget.hide()

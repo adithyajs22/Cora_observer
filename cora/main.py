@@ -130,16 +130,16 @@ class CoraApp:
             self.chat_win.activateWindow()
             self.chat_win.raise_()
 
-    def handle_chat_message(self, text):
-        print(f"User sent: {text}")
-        t = threading.Thread(target=self._process_chat, args=(text,))
+    def handle_chat_message(self, text, attachment=None):
+        print(f"User sent: {text} | File: {attachment}")
+        t = threading.Thread(target=self._process_chat, args=(text, attachment))
         t.start()
         
     def handle_stop(self):
         print("Stop requested.")
         self.observer.stop_chat()
 
-    def _process_chat(self, text):
+    def _process_chat(self, text, attachment=None):
         print("Processing chat in background (Streaming)...")
         
         # 1. Create empty AI bubble
@@ -147,7 +147,7 @@ class CoraApp:
         
         # 2. Stream tokens
         full_response = ""
-        for token in self.observer.stream_chat_with_screen(text):
+        for token in self.observer.stream_chat_with_screen(text, attachment):
             full_response += token
             # Update UI incrementally
             self.chat_win.stream_token_signal.emit(token)
@@ -164,13 +164,17 @@ class CoraApp:
     def show_last_hint(self):
         self.bubble.show_message(self.last_title, self.last_details)
 
-    def handle_overlay_action(self, query):
-        print(f"Overlay Action: {query}")
+    def handle_overlay_action(self, user_text, internal_prompt):
+        print(f"Overlay Action: {user_text}")
+        
+        # 1. Force Open Chat Window First
         self.open_chat()
-        # Simulate user sending this message
-        self.chat_win.add_user(query)
-        # Process it in background
-        t = threading.Thread(target=self._process_chat, args=(query,))
+        
+        # 2. Add USER FRIENDLY message to UI
+        self.chat_win.add_user(user_text)
+        
+        # 3. Process the INTERNAL PROMPT in background
+        t = threading.Thread(target=self._process_chat, args=(internal_prompt,))
         t.start()
 
     def hide_ui_for_capture(self):
