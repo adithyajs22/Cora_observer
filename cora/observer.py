@@ -1,18 +1,22 @@
 import time
 import mss
 import ollama
+import threading
 from PIL import Image
 import io
 import os
 import config
 import json
 import re
+import context_engine
+import ocr_engine
 from PyQt6.QtCore import QObject, pyqtSignal
 
 class ObserverSignal(QObject):
     suggestion_ready = pyqtSignal(object) # json payload
     prepare_capture = pyqtSignal()
     finished_capture = pyqtSignal()
+    error_resolved = pyqtSignal()
 
 class Observer:
     def __init__(self):
@@ -21,89 +25,127 @@ class Observer:
         self.stop_flag = False
         self.signals = ObserverSignal()
         self.model = config.OLLAMA_MODEL 
-        self.chat_history = [] # For maintaining context
+        self.context_engine = context_engine.ContextEngine()
+        self.last_llm_call_time = 0
         
+        # Session Management
+        self.chats_dir = os.path.join(os.getcwd(), "chats")
+        if not os.path.exists(self.chats_dir):
+            os.makedirs(self.chats_dir)
+            
+        self.current_session_id = None
+        self.chat_history = [] 
+        self.create_new_session()
+
+    def create_new_session(self):
+        import uuid
+        self.current_session_id = str(uuid.uuid4())[:8]
+        self.chat_history = []
+        print(f"Created new session: {self.current_session_id}")
+        self.save_session()
+
+    def switch_session(self, session_id):
+        filepath = os.path.join(self.chats_dir, f"{session_id}.json")
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, 'r') as f:
+                    data = json.load(f)
+                    self.chat_history = data.get('history', [])
+                self.current_session_id = session_id
+                print(f"Switched to session: {session_id}")
+                return True
+            except Exception as e:
+                print(f"Error loading session: {e}")
+                return False
+        return False
+
+    def get_sessions(self):
+        sessions = []
+        if not os.path.exists(self.chats_dir): return []
+        
+        for f in os.listdir(self.chats_dir):
+            if f.endswith(".json"):
+                 sid = f.replace(".json", "")
+                 # Load first message as title if poss?
+                 title = f"Chat {sid}"
+                 try:
+                     with open(os.path.join(self.chats_dir, f), 'r') as file:
+                         data = json.load(file)
+                         
+                         # Priority 1: Saved Title
+                         if data.get('title'):
+                             title = data['title']
+                         else:
+                             # Priority 2: First Message Inference (Fallback)
+                             hist = data.get('history', [])
+                             if hist:
+                                 for msg in hist:
+                                     if msg['role'] == 'user':
+                                         txt = msg['content'].split("USER:")[-1].strip()[:30]
+                                         title = txt if txt else title
+                                         break
+                 except: pass
+                 sessions.append({'id': sid, 'title': title})
+        return sessions
+
+    def delete_session(self, session_id):
+        filepath = os.path.join(self.chats_dir, f"{session_id}.json")
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                print(f"Deleted session: {session_id}")
+                
+                # If current session deleted, create new one
+                if self.current_session_id == session_id:
+                    self.create_new_session()
+                return True
+        except Exception as e:
+            print(f"Error deleting session: {e}")
+        return False
+
+    def save_session(self):
+        if not self.current_session_id: return
+        filepath = os.path.join(self.chats_dir, f"{self.current_session_id}.json")
+        try:
+            # Load existing to preserve title
+            # Strip image bytes from history (not JSON serializable)
+            clean_history = []
+            for msg in self.chat_history:
+                clean_msg = {k: v for k, v in msg.items() if k != 'images'}
+                clean_history.append(clean_msg)
+            
+            data = {'id': self.current_session_id, 'history': clean_history}
+            if os.path.exists(filepath):
+                 with open(filepath, 'r') as f:
+                     existing = json.load(f)
+                     if 'title' in existing:
+                         data['title'] = existing['title']
+            
+            with open(filepath, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"Error saving session: {e}")
+
     def stop_chat(self):
         self.stop_flag = True
         print("Stopping generation...")
 
     def clear_history(self):
-        self.chat_history = []
-        print("Chat history cleared.")
+        # Instead of clearing, we create a new session
+        self.create_new_session()
 
     # ... (capture_screen, _image_to_bytes, pause, resume, analyze, read_file_content unused changes omitted)
 
-    def stream_chat_with_screen(self, user_query, attachment=None):
-        self.stop_flag = False
-        try:
-            image_bytes = None
-            
-            # 1. Prepare User Message for this turn
-            user_content = user_query
-            current_images = []
-            
-            # 2. Handle Attachment (Priority Context)
-            if attachment:
-                print(f"Reading attachment: {attachment}")
-                content = self.read_file_content(attachment)
-                # Inject file content into the prompt context for this turn
-                file_context = f"\n\n[PRIORITY CONTEXT - ATTACHED FILE: {os.path.basename(attachment)}]:\n{content}\n[END FILE]\n"
-                user_content = file_context + "\n" + user_content
-                print("Attachment processed. Skipping screen capture for this turn.")
-                
-            else:
-                # 3. Handle Screen Context (Only if no file attached this turn)
-                # We interpret "responding based on screen" issues as:
-                # If the user is just chatting (continuation), we might NOT want to capture screen every single time if it distracts?
-                # But generally, we should capture screen unless they are focused on a file.
-                # Since we are now maintaining history, the previous file context is preserved.
-                
-                print("Capturing screen for chat context...")
-                img = self.capture_screen()
-                image_bytes = self._image_to_bytes(img)
-                if image_bytes:
-                    current_images.append(image_bytes)
-                else:
-                    yield "Error: Could not capture screen."
-                    return
 
-            print(f"Streaming from Ollama ({self.model})... History len: {len(self.chat_history)}")
-            
-            # 4. Construct Message Object
-            new_message = {
-                'role': 'user',
-                'content': user_content
-            }
-            if current_images:
-                new_message['images'] = current_images
-                
-            # 5. Append to History
-            self.chat_history.append(new_message)
-            
-            # 6. Prepare Payload (System Prompt + History)
-            # We inject the System Prompt as the first message
-            messages_payload = [{'role': 'system', 'content': config.CHAT_SYSTEM_PROMPT}] + self.chat_history
-            
-            stream = ollama.chat(model=self.model, messages=messages_payload, stream=True)
-
-            full_response = ""
-            for chunk in stream:
-                if self.stop_flag:
-                    print("Stream stopped by user.")
-                    break
-                token = chunk['message']['content']
-                full_response += token
-                yield token
-            
-            # 7. Append Assistant Response to History
-            self.chat_history.append({'role': 'assistant', 'content': full_response})
-
-        except Exception as e:
-            print(f"Stream Error: {e}")
-            yield f"[Error: {e}]"
 
     def capture_screen(self):
         try:
+            # 0. Prevent Self-Analysis (Handled by hiding UI below)
+            # title = self.context_engine.get_active_window_title().lower()
+            # if "cora" in title:
+            #    print("Skipping screen capture (Cora is active)")
+            #    return None
+
             # 1. Hide UI (Prevent recursion)
             self.signals.prepare_capture.emit()
             time.sleep(0.3) # Give UI time to vanish
@@ -112,8 +154,8 @@ class Observer:
                 monitor = sct.monitors[1]
                 sct_img = sct.grab(monitor)
                 img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-                # Downscale for performance, but keep readable (2048px for text)
-                img.thumbnail((2048, 2048)) 
+                # Downscale for performance, but KEEP READABLE
+                img.thumbnail((3000, 3000)) # Increased from 2048 to preserve text
                 
             # 2. Restore UI
             self.signals.finished_capture.emit()
@@ -127,7 +169,7 @@ class Observer:
     def _image_to_bytes(self, image):
         if not image: return None
         with io.BytesIO() as output:
-            image.save(output, format='JPEG', quality=80)
+            image.save(output, format='PNG') # PNG is lossless, better for text
             return output.getvalue()
 
     def pause(self):
@@ -138,42 +180,110 @@ class Observer:
         self.paused = False
         print("Observer Resumed.")
 
-    def analyze(self, image):
+    def analyze(self, image_data, context_text=""):
+        if self.paused or not image_data: return None
+        
+        # Convert to bytes if PIL Image
+        # Convert to bytes if PIL Image
+        if not isinstance(image_data, bytes):
+            image_data = self._image_to_bytes(image_data)
+        
+        # -----------------------------------------------------------------
+        # HYBRID PERCEPTION: OCR + VISION
+        # -----------------------------------------------------------------
+        ocr_text = ""
         try:
-            image_bytes = self._image_to_bytes(image)
-            # print("Silent Analysis...") 
-            
+             # Re-convert bytes back to PIL for OCR (inefficient but safe for now)
+             ocr_img = Image.open(io.BytesIO(image_data))
+             ocr_text = ocr_engine.extract_text(ocr_img)
+             if len(ocr_text) < 20: 
+                 ocr_text = "" # Ignore noise
+             else:
+                 # Truncate to avoid context overflow (first 2000 chars relevant for context)
+                 ocr_text = ocr_text[:2000] 
+        except Exception as e:
+             print(f"OCR Pipeline Error: {e}")
+
+        # Add Context to Prompt
+        # Add Context to Prompt
+        full_prompt = f"""
+        You are a grounded screen assistant.
+
+        ACTIVE APP: {context_text}
+
+        OCR TEXT:
+        {ocr_text}
+
+        RULES:
+        - Base response ONLY on OCR text.
+        - If OCR empty → return confidence 0.
+        - Detect errors, writing improvements, or code issues.
+        - Suggest EXACT action.
+
+        OUTPUT JSON:
+        {{
+         "reason": "Specific grounded observation",
+         "confidence": 0-1,
+         "suggestions": [{{"label": "Action", "hint": "Specific action"}}]
+        }}
+        """
+        
+        try:
+            # Rate Limiting
+            now = time.time()
+            if now - self.last_llm_call_time < 1.5:
+                return None
+            self.last_llm_call_time = now
+
+            # Use general SYSTEM_PROMPT for visual analysis (Productivity/Terminal)
             response = ollama.chat(model=self.model, messages=[
-                {
-                    'role': 'user',
-                    'content': config.SYSTEM_PROMPT,
-                    'images': [image_bytes]
-                }
+                {'role': 'system', 'content': config.SYSTEM_PROMPT},
+                {'role': 'user', 'content': full_prompt, 'images': [image_data]}
             ])
             text = response['message']['content'].strip()
-            
-            # Clean JSON (sometimes LLMs add markdown)
+            print(f"DEBUG: RAW OBSERVER OUT: {text[:100]}...") # Limit log
+
+            # Clean JSON
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
             elif "```" in text:
                 text = text.split("```")[1].split("```")[0].strip()
-                
-            data = json.loads(text)
             
-            # Confidence Check
-            confidence = data.get("confidence", 0.0)
-            if confidence >= config.PROACTIVE_THRESHOLD:
-                return data
-            else:
-                # print(f"Low Confidence ({confidence}): {data.get('reason')}")
-                return None
-                
-        except json.JSONDecodeError:
-            print("Observer: Failed to parse JSON from AI.")
-            # print(text) 
-            return None
+            # Loose JSON fix
+            if not text.endswith("}"): 
+                 idx = text.rfind("}")
+                 if idx != -1: text = text[:idx+1]
+
+            return json.loads(text)
         except Exception as e:
-            print(f"Ollama Silent Error: {e}")
+            # print(f"Observer Analyze Error: {e}")
+            return None
+            # print(f"Ollama Analyze Error: {e}") 
+            return None
+
+    def update_session_title(self, session_id, user_text):
+        if not user_text: return
+        try:
+            # Generate a short 3-5 word title
+            prompt = f"Summarize this user query into a short 3-5 word title: '{user_text}'. Return ONLY the title, no quotes."
+            response = ollama.chat(model=self.model, messages=[
+                {'role': 'user', 'content': prompt}
+            ])
+            title = response['message']['content'].strip().replace('"', '')
+            
+            # Save the new title
+            filepath = os.path.join(self.chats_dir, f"{session_id}.json")
+            if os.path.exists(filepath):
+                with open(filepath, 'r+') as f:
+                    data = json.load(f)
+                    data['title'] = title
+                    f.seek(0)
+                    json.dump(data, f, indent=2)
+                    f.truncate()
+            print(f"Session {session_id} renamed to: {title}")
+            return title
+        except Exception as e:
+            print(f"Title Generation Error: {e}")
             return None
 
     def read_file_content(self, path):
@@ -193,13 +303,30 @@ class Observer:
                          if extract:
                              text += extract + "\n"
                     
+                    # FALLBACK: If text extraction failed (Scanned PDF), use OCR
                     if len(text.strip()) < 50:
-                        return f"[WARNING: Extracted text from PDF is very short ({len(text)} chars). The PDF might be scanned images, which I cannot read directly. Please open the PDF on your screen so I can 'see' it instead.]"
+                        try:
+                            # Try PDF -> Image -> OCR Strategy
+                            from pdf2image import convert_from_path
+                            import pytesseract
+                            
+                            print("PDF is likely scanned. Attempting OCR...")
+                            images = convert_from_path(path, first_page=1, last_page=3)
+                            ocr_text = ""
+                            for img in images:
+                                ocr_text += pytesseract.image_to_string(img) + "\n"
+                                
+                            if len(ocr_text.strip()) > 50:
+                                return f"[OCR EXTRACTED FROM SCANNED PDF]:\n{ocr_text}"
+                        except Exception as ocr_e:
+                            print(f"OCR Fallback Failed: {ocr_e}")
+                            
+                        return f"[WARNING: Extracted text from PDF is very short ({len(text)} chars). The PDF might be scanned. Please open it on your screen so I can see it.]"
                         
                     print(f"PDF Parsing Success: {len(text)} chars extracted.")
                     return text
                 except ImportError:
-                    return f"[PDF detected at {path}. Install 'pypdf' to read content: `pip install pypdf`]"
+                    return f"[PDF detected at {path}. Install 'pypdf' (and optional 'pdf2image', 'pytesseract') to read content.]"
                 except Exception as e:
                     return f"[Error reading PDF: {e}]"
 
@@ -218,50 +345,140 @@ class Observer:
         self.stop_flag = False
         try:
             image_bytes = None
-            file_context = ""
+            current_images = []
             
-            # 1. Handle Attachment (Priority)
+            # 1. Fetch OS Context (Active Window, File)
+            os_context = self.context_engine.get_context_snapshot()
+            window_title = os_context.get('window_title', 'Unknown')
+            mode_primary = os_context.get('mode_primary', os_context.get('mode', 'general'))
+            
+            print(f"Context: {window_title} ({mode_primary})")
+            
+            # 2. Prepare Base Content
+            prompt_context = ""
+            
+            # 3. Handle Attachment vs OS Context
+            # 3. Handle Attachment vs OS Context
             if attachment:
                 print(f"Reading attachment: {attachment}")
-                content = self.read_file_content(attachment)
-                file_context = f"\n\n[PRIORITY CONTEXT - ATTACHED FILE]:\n{content}\n[END FILE]\n"
                 
-                # CRITICAL: If a file is attached, DO NOT capture the screen.
-                # This forces the model to focus 100% on the file content.
-                # The user explicitly requested: "if im asking about file it needs to say about file"
-                # and "not to read its on screen only the other screen" (which implies ignoring screen context if file is present).
-                print("Skipping screen capture to focus on attachment.")
+                # Check directly for Image attachment
+                _, ext = os.path.splitext(attachment)
+                if ext.lower() in ['.png', '.jpg', '.jpeg', '.bmp', '.gif']:
+                     print("Image attachment detected. Loading for vision context.")
+                     try:
+                         with open(attachment, "rb") as f:
+                             image_bytes = f.read()
+                             current_images.append(image_bytes)
+                         prompt_context = f"\n[User has attached an image: {os.path.basename(attachment)}]\n"
+                     except Exception as e:
+                         prompt_context = f"\n[Error loading attached image: {e}]\n"
+                         
+                else:
+                    # Try reading text/pdf content
+                    content = self.read_file_content(attachment)
+                    prompt_context = f"\n\n[PRIORITY CONTEXT - ATTACHED FILE: {os.path.basename(attachment)}]:\n{content}\n[END FILE]\n"
+                    
+                    # Refined Logic: Only skip screen capture if we got MEANINGFUL text
+                    # If content starts with "[" it likely indicates a warning/error from read_file_content
+                    # (e.g., Scanned PDF warning, File type warning)
+                    if content.strip().startswith("[WARNING") or content.strip().startswith("[Error"):
+                        print("Text extraction insufficient (e.g. Scanned PDF). Falling back to Screen Capture.")
+                        print("Please ensure the document is visible on your screen.")
+                        img = self.capture_screen()
+                        cap_bytes = self._image_to_bytes(img)
+                        if cap_bytes: current_images.append(cap_bytes)
+                    else:
+                        print("STRICT PRIORITY: Using Attachment Content (Text Extracted).")
+                        # We do NOT capture screen strictly if text was read successfully
+                        # unles explicitly asked
+                        pass
             
+            elif mode_primary == 'developer' and os_context.get('file_content'):
+                 # 4. Developer Mode: Use File Content provided by Context Engine
+                 print(f"Developer Mode detected. Using active file: {os_context['file_path']}")
+                 prompt_context = f"\n\n[OS CONTEXT - ACTIVE FILE]:\n{os_context['file_content']}\n[END FILE]\n"
+                 
+                 # Check for explicit vision request explicitly here too
+                 vision_keywords = ["look", "see", "screen", "visual", "watch", "view", "active window", "what is this", "screenshot"]
+                 if any(k in user_query.lower() for k in vision_keywords):
+                     print("Developer Mode: Vision keywords detected. Overriding strict text-only.")
+                     img = self.capture_screen()
+                     image_bytes = self._image_to_bytes(img)
+                     if image_bytes: current_images.append(image_bytes)
+                 else:
+                     # DISABLE Screen Capture for Code Fixing to avoid LLaVA "I don't see code" issues
+                     print("Skipping screen capture (Code Context Provided).")
+                     # img = self.capture_screen()
+                     # image_bytes = self._image_to_bytes(img)
+                     # if image_bytes: current_images.append(image_bytes)
+
             else:
-                # 2. Handle Screen Context (Only if no file)
-                print("Capturing screen for chat context...")
-                img = self.capture_screen()
-                image_bytes = self._image_to_bytes(img)
-                if not image_bytes:
-                    yield "Error: Could not capture screen."
-                    return
+                # 5. General/Chat Mode: ENABLE VISION unless context says otherwise
+                # Default: Vision on for standard chat to support "What's on my screen"
+                # But careful about latency.
+                
+                # Heuristic: If user asks about screen/visuals OR provides no other context, look at screen.
+                vision_keywords = ["look", "see", "screen", "visual", "watch", "view", "active window", "what is this", "screenshot", "observe", "check", "debug", "fix"]
+                
+                # Also if query is short/open-ended like "help" or "explain this"
+                is_short_query = len(user_query.split()) < 5
+                
+                if any(k in user_query.lower() for k in vision_keywords) or is_short_query:
+                    print("Visual keywords or short query detected. Activating Vision Mode.")
+                    print("Capturing screen for visual context...")
+                    img = self.capture_screen()
+                    if img: # Capture successfully
+                        image_bytes = self._image_to_bytes(img)
+                        if image_bytes: current_images.append(image_bytes)
+                else:
+                    # If chatting about abstract topics ("What is python?"), maybe skip vision?
+                    # For now, let's be safe and capture if not explicitly text-heavy.
+                    print("Reactive Mode: Text Only (Specific Query).")
 
-            print(f"Streaming from Ollama ({self.model})...")
-            
-            full_prompt = f"{config.CHAT_SYSTEM_PROMPT}\n{file_context}\nUSER: {user_query}\nCORA:"
-            
-            payload = {
-                'role': 'user',
-                'content': full_prompt
-            }
-            
-            # Only add image if we captured it
-            if image_bytes:
-                payload['images'] = [image_bytes]
+            # 6. Select System Prompt based on mode_primary
+            if mode_primary == 'developer':
+                system_prompt = config.DEV_SYSTEM_PROMPT
+            elif mode_primary == 'writing':
+                system_prompt = config.PRODUCTIVITY_SYSTEM_PROMPT
+            elif mode_primary == 'reading':
+                system_prompt = config.READING_SYSTEM_PROMPT
+            else:
+                system_prompt = config.CHAT_SYSTEM_PROMPT
 
-            stream = ollama.chat(model=self.model, messages=[payload], stream=True)
+            print(f"Streaming ({self.model})...")
+            
+            # 7. Construct History-Aware Message
+            user_content = f"{prompt_context}\nUSER: {user_query}"
+            
+            new_message = {'role': 'user', 'content': user_content}
+            
+            # Ensure proper image handling for Ollama
+            if current_images: 
+                # Ollama expects list of base64 strings OR bytes.
+                # Since _image_to_bytes returns bytes, and we read file as bytes, we are consistent.
+                new_message['images'] = current_images
+                
+            self.chat_history.append(new_message)
+            
+            # Generate Title if First Message
+            if len(self.chat_history) == 1:
+                t = threading.Thread(target=self.update_session_title, args=(self.current_session_id, user_query), daemon=True)
+                t.start()
+            
+            # 8. Send to LLM
+            messages_payload = [{'role': 'system', 'content': system_prompt}] + self.chat_history
+            stream = ollama.chat(model=self.model, messages=messages_payload, stream=True)
 
+            full_response = ""
             for chunk in stream:
-                if self.stop_flag:
-                    print("Stream stopped by user.")
-                    break
+                if self.stop_flag: break
                 token = chunk['message']['content']
+                full_response += token
                 yield token
+            
+            self.chat_history.append({'role': 'assistant', 'content': full_response})
+            self.save_session()
 
         except Exception as e:
             print(f"Stream Error: {e}")
@@ -270,24 +487,100 @@ class Observer:
     def loop(self):
         print("Observer started (Silent Mode)...")
         self.running = True
+        self.last_reported_error_sig = None
+        self.loop_count = 0
+        
         while self.running:
             if self.paused:
                 time.sleep(1)
                 continue
 
             try:
-                # 1. Capture
-                img = self.capture_screen()
+                # ----------------------------------------------
+                # 1. Proactive OS Monitoring (Lightweight)
+                # ----------------------------------------------
+                ctx = self.context_engine.get_context_snapshot()
                 
-                # 2. Analyze (Silent Mode)
-                payload = self.analyze(img)
+                # Check for Syntax Errors
+                if ctx.get('error'):
+                    sig = ctx['error_signature']
+                    if sig != self.last_reported_error_sig:
+                        # NEW ERROR DETECTED!
+                        print(f"🚨 New Syntax Error: {ctx['error']['message']} in {os.path.basename(ctx['error']['file'])}")
+                        
+                        # Generate Fix Suggestions via LLM (Silent)
+                        # We use the existing analyze flow but inject the specific error context
+                        error_prompt = f"""
+                        SYNTAX ERROR DETECTED:
+                        File: {ctx['error']['file']}
+                        Line: {ctx['error']['line']}
+                        Error: {ctx['error']['message']}
+                        Code:
+                        {ctx['error']['context']}
+                        
+                        Provide a brief fix explanation and the corrected code block.
+                        Format as JSON: {{ "reason": "Explanation", "code": "Corrected Code", "confidence": 1.0 }}
+                        """
+                        
+                        # Call LLM
+                        response = ollama.chat(model=self.model, messages=[
+                             {'role': 'system', 'content': config.DEV_SYSTEM_PROMPT},
+                             {'role': 'user', 'content': error_prompt}
+                        ])
+                        
+                        # Parse
+                        text = response['message']['content'].strip()
+                         # Clean JSON
+                        if "```json" in text:
+                            text = text.split("```json")[1].split("```")[0].strip()
+                        elif "```" in text:
+                            text = text.split("```")[1].split("```")[0].strip()
+                        
+                        try:
+                            payload = json.loads(text)
+                            payload['type'] = 'syntax_error' # Mark for UI
+                            self.signals.suggestion_ready.emit(payload)
+                            self.last_reported_error_sig = sig # Mark handled
+                        except:
+                            pass
+                            
+                # 2. Visual Monitoring (Fallback)
+                # Now inclusive of 'developer' mode for unsaved changes/logic errors
+                # But throttled to avoid excessive LLM calls
+                check_visual = False
                 
-                if payload:
-                    reason = payload.get('reason', 'Unknown Reason')
-                    confidence = payload.get('confidence', 0.0)
-                    print(f"✨ PROACTIVE ({confidence}): {reason}")
-                    self.signals.suggestion_ready.emit(payload)
+                if ctx.get('mode_primary', ctx.get('mode')) in ['terminal', 'general']:
+                    check_visual = True
+                elif ctx.get('mode_primary', ctx.get('mode')) == 'developer':
+                    check_visual = False
+
+                if check_visual:
+                     # Only check visual if we haven't seen a file error recently
+                     # And if we haven't reported a visual suggestion recently
+                     img = self.capture_screen()
+                     payload = self.analyze(img) 
+                     
+                     if payload:
+                         reason = payload.get('reason', '')
+                         confidence = payload.get('confidence', 0.0)
+
+                         # FILTER 1: Self-Reflection Prevention
+                         if "Cora" in reason or "AI" in reason or "Ui" in reason:
+                             pass # Skip
+                         
+                         # FILTER 2: Low Confidence Prevention
+                         elif confidence < config.PROACTIVE_THRESHOLD:
+                             pass # Skip low confidence
+                         else:
+                             # FILTER 3: De-Duplication
+                             visual_sig = f"{reason}:{payload.get('suggestions', [])}"
+                             
+                             if visual_sig != self.last_reported_error_sig:
+                                 print(f"✨ Visual Suggestion: {reason}")
+                                 self.signals.suggestion_ready.emit(payload)
+                                 self.last_reported_error_sig = visual_sig
                 
+                self.loop_count += 1
             except Exception as e:
                 print(f"Observer Loop Error: {e}")
             
