@@ -28,6 +28,10 @@ class Observer:
         self.context_engine = context_engine.ContextEngine()
         self.last_llm_call_time = 0
         
+        # Proactive context storage (for grounded suggestion execution)
+        self.last_ocr_text = ""
+        self.last_proactive_screenshot = None  # bytes
+        
         # Session Management
         self.chats_dir = os.path.join(os.getcwd(), "chats")
         if not os.path.exists(self.chats_dir):
@@ -140,11 +144,10 @@ class Observer:
 
     def capture_screen(self):
         try:
-            # 0. Prevent Self-Analysis (Handled by hiding UI below)
-            # title = self.context_engine.get_active_window_title().lower()
-            # if "cora" in title:
-            #    print("Skipping screen capture (Cora is active)")
-            #    return None
+            # 0. Prevent Self-Analysis (Recursion Guard)
+            win_title = self.context_engine.get_active_window_title().lower()
+            if any(x in win_title for x in ["cora", "assistant", "suggestion"]):
+                return None
 
             # 1. Hide UI (Prevent recursion)
             self.signals.prepare_capture.emit()
@@ -183,6 +186,14 @@ class Observer:
     def analyze(self, image_data, context_text=""):
         if self.paused or not image_data: return None
         
+        # Self-analysis guard: skip if current window is Cora UI
+        try:
+            win_title = self.context_engine.get_active_window_title().lower()
+            if any(kw in win_title for kw in ["cora", "assistant", "suggestion"]):
+                return None
+        except:
+            pass
+        
         # Convert to bytes if PIL Image
         # Convert to bytes if PIL Image
         if not isinstance(image_data, bytes):
@@ -203,6 +214,10 @@ class Observer:
                  ocr_text = ocr_text[:2000] 
         except Exception as e:
              print(f"OCR Pipeline Error: {e}")
+        
+        # Store for suggestion execution pipeline
+        self.last_ocr_text = ocr_text
+        self.last_proactive_screenshot = image_data
 
         # Add Context to Prompt
         # Add Context to Prompt
@@ -254,7 +269,9 @@ class Observer:
                  idx = text.rfind("}")
                  if idx != -1: text = text[:idx+1]
 
-            return json.loads(text)
+            payload = json.loads(text)
+            payload["screen_context"] = ocr_text
+            return payload
         except Exception as e:
             # print(f"Observer Analyze Error: {e}")
             return None
@@ -341,7 +358,7 @@ class Observer:
         except Exception as e:
             return f"[Error reading file: {e}]"
 
-    def stream_chat_with_screen(self, user_query, attachment=None):
+    def stream_chat_with_screen(self, user_query, attachment=None, proactive_context=None):
         self.stop_flag = False
         try:
             image_bytes = None
@@ -357,9 +374,60 @@ class Observer:
             # 2. Prepare Base Content
             prompt_context = ""
             
+            # ---------------------------------------------------------------
+            # PROACTIVE CONTEXT INJECTION (Grounded Suggestion Execution)
+            # If a proactive context is provided, use it instead of capturing
+            # fresh screen. This ensures suggestion clicks stay grounded.
+            # ---------------------------------------------------------------
+            if proactive_context:
+                print("Using stored proactive context (grounded suggestion execution).")
+                pc_mode = proactive_context.get('mode_primary', mode_primary)
+                pc_window = proactive_context.get('window_title', window_title)
+                pc_reason = proactive_context.get('reason', '')
+                pc_ocr = proactive_context.get('ocr_text', '')
+                pc_screenshot = proactive_context.get('screenshot', None)
+                pc_error_ctx = proactive_context.get('error_context', '')
+                pc_error_file = proactive_context.get('error_file', '')
+                pc_error_msg = proactive_context.get('error_message', '')
+                pc_file_content = proactive_context.get('file_content', '')
+                
+                # Build grounded command prompt
+                prompt_context = f"""\n\n[COMMAND MODE: Suggestion Execution]
+
+ACTIVE APP: {pc_window}
+MODE: {pc_mode}
+
+DETECTED CONTEXT:
+{pc_reason}
+"""
+                if pc_error_ctx:
+                    prompt_context += f"""\nERROR DETAILS:
+File: {pc_error_file}
+Error: {pc_error_msg}
+Code:\n{pc_error_ctx}
+"""
+                if pc_file_content:
+                    prompt_context += f"""\n[ACTIVE FILE CONTENT]:\n{pc_file_content}\n[END FILE]
+"""
+                if pc_ocr:
+                    prompt_context += f"""\nOCR TEXT (from screen):
+{pc_ocr[:2000]}
+"""
+                prompt_context += """\nTASK:
+Execute the suggestion on the detected screen content.
+Do not say you cannot see the screen.
+Act as if this context is visible.\n"""
+                
+                # Use stored screenshot if available
+                if pc_screenshot:
+                    current_images.append(pc_screenshot)
+                    print("Proactive context: Using stored screenshot.")
+                
+                # Use mode from proactive context for system prompt selection
+                mode_primary = pc_mode
+            
             # 3. Handle Attachment vs OS Context
-            # 3. Handle Attachment vs OS Context
-            if attachment:
+            elif attachment:
                 print(f"Reading attachment: {attachment}")
                 
                 # Check directly for Image attachment
@@ -379,27 +447,19 @@ class Observer:
                     content = self.read_file_content(attachment)
                     prompt_context = f"\n\n[PRIORITY CONTEXT - ATTACHED FILE: {os.path.basename(attachment)}]:\n{content}\n[END FILE]\n"
                     
-                    # Refined Logic: Only skip screen capture if we got MEANINGFUL text
-                    # If content starts with "[" it likely indicates a warning/error from read_file_content
-                    # (e.g., Scanned PDF warning, File type warning)
                     if content.strip().startswith("[WARNING") or content.strip().startswith("[Error"):
-                        print("Text extraction insufficient (e.g. Scanned PDF). Falling back to Screen Capture.")
-                        print("Please ensure the document is visible on your screen.")
+                        print("Text extraction insufficient. Falling back to Screen Capture.")
                         img = self.capture_screen()
                         cap_bytes = self._image_to_bytes(img)
                         if cap_bytes: current_images.append(cap_bytes)
                     else:
                         print("STRICT PRIORITY: Using Attachment Content (Text Extracted).")
-                        # We do NOT capture screen strictly if text was read successfully
-                        # unles explicitly asked
-                        pass
             
             elif mode_primary == 'developer' and os_context.get('file_content'):
                  # 4. Developer Mode: Use File Content provided by Context Engine
                  print(f"Developer Mode detected. Using active file: {os_context['file_path']}")
                  prompt_context = f"\n\n[OS CONTEXT - ACTIVE FILE]:\n{os_context['file_content']}\n[END FILE]\n"
                  
-                 # Check for explicit vision request explicitly here too
                  vision_keywords = ["look", "see", "screen", "visual", "watch", "view", "active window", "what is this", "screenshot"]
                  if any(k in user_query.lower() for k in vision_keywords):
                      print("Developer Mode: Vision keywords detected. Overriding strict text-only.")
@@ -407,33 +467,21 @@ class Observer:
                      image_bytes = self._image_to_bytes(img)
                      if image_bytes: current_images.append(image_bytes)
                  else:
-                     # DISABLE Screen Capture for Code Fixing to avoid LLaVA "I don't see code" issues
                      print("Skipping screen capture (Code Context Provided).")
-                     # img = self.capture_screen()
-                     # image_bytes = self._image_to_bytes(img)
-                     # if image_bytes: current_images.append(image_bytes)
 
             else:
-                # 5. General/Chat Mode: ENABLE VISION unless context says otherwise
-                # Default: Vision on for standard chat to support "What's on my screen"
-                # But careful about latency.
-                
-                # Heuristic: If user asks about screen/visuals OR provides no other context, look at screen.
+                # 5. General/Chat Mode
                 vision_keywords = ["look", "see", "screen", "visual", "watch", "view", "active window", "what is this", "screenshot", "observe", "check", "debug", "fix"]
-                
-                # Also if query is short/open-ended like "help" or "explain this"
                 is_short_query = len(user_query.split()) < 5
                 
                 if any(k in user_query.lower() for k in vision_keywords) or is_short_query:
                     print("Visual keywords or short query detected. Activating Vision Mode.")
                     print("Capturing screen for visual context...")
                     img = self.capture_screen()
-                    if img: # Capture successfully
+                    if img:
                         image_bytes = self._image_to_bytes(img)
                         if image_bytes: current_images.append(image_bytes)
                 else:
-                    # If chatting about abstract topics ("What is python?"), maybe skip vision?
-                    # For now, let's be safe and capture if not explicitly text-heavy.
                     print("Reactive Mode: Text Only (Specific Query).")
 
             # 6. Select System Prompt based on mode_primary
@@ -539,6 +587,9 @@ class Observer:
                         try:
                             payload = json.loads(text)
                             payload['type'] = 'syntax_error' # Mark for UI
+                            payload.setdefault('screen_context', '')
+                            payload.setdefault('error_context', '')
+                            payload.setdefault('suggestions', [])
                             self.signals.suggestion_ready.emit(payload)
                             self.last_reported_error_sig = sig # Mark handled
                         except:

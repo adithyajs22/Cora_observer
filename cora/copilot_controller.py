@@ -29,6 +29,9 @@ class CopilotController(QThread):
         # State Tracking
         self.last_active_window = None
         self.last_writing_check_time = 0
+        
+        # Proactive context storage (for grounded suggestion execution)
+        self.last_proactive_context = None
 
 
     def on_user_dismissed(self):
@@ -100,6 +103,17 @@ class CopilotController(QThread):
                 mode_primary = snapshot.get('mode_primary', current_mode)
                 mode_secondary = snapshot.get('mode_secondary', 'unknown')
                 
+                # FIX 2: Skip Cora's own UI (internal mode)
+                if mode_primary == "internal":
+                    time.sleep(0.2)
+                    continue
+                
+                # Skip Cora suggestion window (not internal, but nothing to analyze)
+                cw_lower = (current_window or "").lower()
+                if "cora suggestion" in cw_lower:
+                    time.sleep(0.5)
+                    continue
+                
                 idle_time = self.context_engine.get_idle_time()
                 
                 # DEBUG: Pulse Check
@@ -119,10 +133,13 @@ class CopilotController(QThread):
                         time.sleep(0.5)
                         continue
                     
-                    # Reset State for new window
+                    # Reset visual suggestion state for new window
                     self.observer.signals.error_resolved.emit() # Collapse to idle orb
                     self.last_visual_sig = None
-                    self.last_error_signature = None # Allow re-discovery of errors (e.g. switching back to IDE)
+                    # NOTE: Do NOT reset last_error_signature here.
+                    # The error signature includes the code text, so it will
+                    # naturally update when the user actually fixes the code.
+                    # Resetting it here causes re-triggering on every app switch.
                     
                     # Short grace period to let UI settle
                     time.sleep(1.0) 
@@ -234,6 +251,7 @@ class CopilotController(QThread):
             "code": code,
             "suggestions": [{"label": "Fix Error", "hint": "Show corrected code"}],
             "confidence": 1.0,
+            "screen_context": "",
             "error_file": error.get('file', ''),
             "error_line": error.get('line', ''),
             "error_message": error.get('message', ''),
@@ -252,24 +270,41 @@ class CopilotController(QThread):
         )
         self.observer.signals.suggestion_ready.emit(temp_payload)
         
+        # Store proactive context for grounded suggestion execution
+        self.last_proactive_context = {
+            'mode_primary': snapshot.get('mode_primary', snapshot.get('mode', 'general')),
+            'window_title': snapshot.get('window_title', ''),
+            'reason': f"Error: {error.get('message', '')}",
+            'ocr_text': self.observer.last_ocr_text,
+            'screenshot': self.observer.last_proactive_screenshot,
+            'error_file': error.get('file', ''),
+            'error_line': error.get('line', ''),
+            'error_message': error.get('message', ''),
+            'error_context': error.get('context', ''),
+            'file_content': snapshot.get('file_content', ''),
+        }
+        
         # Construct Prompt — JSON ONLY, no markdown
         error_prompt = f"""You are a strict debugging assistant.
 
 LANGUAGE: Python
-FILE: {error['file']}
-LINE: {error['line']}
-ERROR: {error['message']}
+
+ERROR:
+File: {error['file']}
+Line: {error['line']}
+Message: {error['message']}
 
 CODE:
 {error.get('context', '')}
 
 TASK:
-1. Identify the exact syntax mistake.
-2. Provide the corrected code.
-3. Do NOT ask questions or give generic advice.
+1. Identify exact syntax mistake
+2. Provide corrected code
+3. Keep explanation MAX 1 sentence
+4. Do NOT give teaching paragraphs
 
-RESPOND WITH ONLY THIS JSON (no markdown, no explanation outside JSON):
-{{"reason": "Brief explanation of the fix", "code": "The corrected code"}}"""
+OUTPUT JSON ONLY:
+{{"reason": "short explanation", "code": "corrected code"}}"""
 
         # DEBUG LOGGING
         print("--- DEBUG PROMPT START ---")
@@ -354,23 +389,43 @@ RESPOND WITH ONLY THIS JSON (no markdown, no explanation outside JSON):
             should_check = False
                 
         if should_check:
+             # Rate Limiting (shared 1.5s cooldown)
+             now = time.time()
+             if now - self.last_llm_call_time < 1.5:
+                 return
+
              # Capture via Observer
              img = self.observer.capture_screen()
              win_title = snapshot.get('window_title', 'Unknown').lower()
              
              # Double Check: If active window is Cora UI, ABORT
-             cora_titles = ["cora ai", "cora suggestion"]
-             if any(win_title.strip() == ct for ct in cora_titles):
+             cora_keywords = ["cora", "assistant", "suggestion"]
+             if any(kw in win_title for kw in cora_keywords):
                  return
 
              # Analyze
              payload = self.observer.analyze(img, context_text=f"Active Window: {win_title}")
              if payload:
+                 # Store proactive context for grounded suggestion execution
+                 self.last_proactive_context = {
+                     'mode_primary': snapshot.get('mode_primary', snapshot.get('mode', 'general')),
+                     'window_title': win_title,
+                     'reason': payload.get('reason', ''),
+                     'ocr_text': self.observer.last_ocr_text,
+                     'screenshot': self.observer.last_proactive_screenshot,
+                     'error_file': '', 'error_line': '', 'error_message': '', 'error_context': '',
+                     'file_content': '',
+                 }
                  self.process_visual_payload(payload)
 
     def handle_writing_assistance(self, snapshot):
         print("Copilot: ✍️ Writing Pause Detected. Analyzing...")
         try:
+             # Rate Limiting (shared 1.5s cooldown)
+             now = time.time()
+             if now - self.last_llm_call_time < 1.5:
+                 return
+
              # 1. Capture Screen (Productivity App)
              img = self.observer.capture_screen()
              win_title = snapshot.get('window_title', 'Unknown Application')
@@ -394,6 +449,17 @@ RESPOND WITH ONLY THIS JSON (no markdown, no explanation outside JSON):
                              {"label": "Explain", "hint": "Explain this content"},
                              {"label": "Summarize", "hint": "Summarize this content"}
                          ]
+
+                     # Store proactive context for grounded suggestion execution
+                     self.last_proactive_context = {
+                         'mode_primary': 'writing',
+                         'window_title': win_title,
+                         'reason': payload.get('reason', ''),
+                         'ocr_text': self.observer.last_ocr_text,
+                         'screenshot': self.observer.last_proactive_screenshot,
+                         'error_file': '', 'error_line': '', 'error_message': '', 'error_context': '',
+                         'file_content': '',
+                     }
 
                      # 5. Deduplicate
                      reason = payload.get('reason', '')
@@ -442,6 +508,11 @@ RESPOND WITH ONLY THIS JSON (no markdown, no explanation outside JSON):
     def handle_reading_assistance(self, snapshot):
         print("Copilot: 📖 Reading Pause Detected. Analyzing...")
         try:
+             # Rate Limiting (shared 1.5s cooldown)
+             now = time.time()
+             if now - self.last_llm_call_time < 1.5:
+                 return
+
              # 1. Capture Screen 
              img = self.observer.capture_screen()
              win_title = snapshot.get('window_title', 'Unknown Document')
@@ -465,6 +536,17 @@ RESPOND WITH ONLY THIS JSON (no markdown, no explanation outside JSON):
                              {"label": "Key Points", "hint": "Extract bullet points"}
                          ]
                      
+                     # Store proactive context for grounded suggestion execution
+                     self.last_proactive_context = {
+                         'mode_primary': 'reading',
+                         'window_title': win_title,
+                         'reason': payload.get('reason', ''),
+                         'ocr_text': self.observer.last_ocr_text,
+                         'screenshot': self.observer.last_proactive_screenshot,
+                         'error_file': '', 'error_line': '', 'error_message': '', 'error_context': '',
+                         'file_content': '',
+                     }
+
                      reason = payload.get('reason', '')
                      sig = f"{reason}"
                      

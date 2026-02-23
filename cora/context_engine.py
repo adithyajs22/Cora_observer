@@ -225,13 +225,21 @@ class ContextEngine:
              mode_secondary = "browser"
 
         # 7. Chat Mode (Cora App)
-        # IMPORTANT: Only match Cora's OWN window titles, NOT folder names like "Cora antig"
-        # Cora's windows: "Cora AI" (chat), "Cora Suggestion" (overlay)
-        cora_ui_titles = ["cora ai", "cora suggestion"]
+        # IMPORTANT: Only match Cora's CHAT window, NOT the suggestion overlay.
+        # "Cora Suggestion" must NOT trigger internal mode — it would pause the proactive loop.
+        cora_ui_titles = ["cora ai"]
         is_cora_ui = any(t == title or t == title.strip() for t in cora_ui_titles)
         if is_cora_ui or title == "assistant":
-             mode_primary = "chat"
-             mode_secondary = "chat"
+             return {
+                 "window_title": self.last_active_window,
+                 "mode": "internal",
+                 "mode_primary": "internal",
+                 "mode_secondary": "internal",
+                 "file_path": None,
+                 "file_content": None,
+                 "error": None,
+                 "error_signature": None
+             }
 
         snapshot = {
             "window_title": self.last_active_window,

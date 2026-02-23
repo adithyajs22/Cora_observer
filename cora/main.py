@@ -173,7 +173,7 @@ class CoraApp:
         print("Stop requested.")
         self.observer.stop_chat()
 
-    def _process_chat(self, text, attachment=None):
+    def _process_chat(self, text, attachment=None, proactive_context=None):
         print("Processing chat in background (Streaming)...")
         
         # 1. Create empty AI bubble
@@ -181,7 +181,7 @@ class CoraApp:
         
         # 2. Stream tokens
         full_response = ""
-        for token in self.observer.stream_chat_with_screen(text, attachment):
+        for token in self.observer.stream_chat_with_screen(text, attachment, proactive_context=proactive_context):
             full_response += token
             # Update UI incrementally
             self.chat_win.stream_token_signal.emit(token)
@@ -260,10 +260,16 @@ class CoraApp:
         # 2. Add clean USER FRIENDLY message to UI (hide prompt details)
         self.chat_win.add_user(user_text)
         
-        # 3. Process the INTERNAL PROMPT in background
+        # 3. Grab stored proactive context for grounded chat (FIX 7)
+        proactive_ctx = None
+        if hasattr(self, 'copilot') and self.copilot.last_proactive_context:
+            proactive_ctx = self.copilot.last_proactive_context
+            print(f"Grounding chat with proactive context: mode={proactive_ctx.get('mode_primary')}")
+        
+        # 4. Process the INTERNAL PROMPT in background
         # FORCE BUTTON UPDATE
         self.chat_win.set_generating_state(True)
-        t = threading.Thread(target=self._process_chat, args=(internal_prompt,))
+        t = threading.Thread(target=self._process_chat, args=(internal_prompt,), kwargs={'proactive_context': proactive_ctx})
         t.start()
 
     def hide_ui_for_capture(self):

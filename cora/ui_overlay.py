@@ -33,10 +33,10 @@ class ProactiveBubble(QWidget):
         
         # Determine Screen Position (Bottom Right)
         self.screen_geo = QApplication.primaryScreen().availableGeometry()
-        self.bubble_size = 80
-        self.panel_width = 360
-        self.panel_height = 280  # Taller to fit input box
-        self.margin = 30
+        self.bubble_size = 70
+        self.panel_width = 300
+        self.panel_height = 220
+        self.margin = 20
         
         # Initial Geometry (Hidden)
         self.setGeometry(0, 0, 0, 0)
@@ -200,16 +200,18 @@ class ProactiveBubble(QWidget):
             self.bubble_btn.setIcon(QIcon())
             self.bubble_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background-color: rgba(15, 23, 42, 0.6);
-                    border: 1px solid rgba(71, 85, 105, 0.5);
+                    background-color: rgba(15, 23, 42, 0.7);
+                    border: 2px solid rgba(99, 133, 180, 0.4);
                     border-radius: {self.bubble_size//2}px;
                     border-image: url(icon.png) 0 0 0 0 stretch;
                 }}
                 QPushButton:hover {{
-                    background-color: rgba(15, 23, 42, 0.9);
-                    border-color: #94a3b8;
+                    background-color: rgba(15, 23, 42, 0.95);
+                    border-color: #60a5fa;
                 }}
             """)
+            # Gentle breathing glow to show orb is available
+            self._pulse_timer.start(2000)
             
         elif state == self.STATE_ERROR:
             self.bubble_btn.setText("⚠️")
@@ -263,9 +265,22 @@ class ProactiveBubble(QWidget):
         """Animate orb border glow via opacity toggle."""
         try:
             self._pulse_phase = (self._pulse_phase + 1) % 2
-            opacity = "1.0" if self._pulse_phase == 0 else "0.5"
             
-            if self.orb_state == self.STATE_ERROR:
+            if self.orb_state == self.STATE_IDLE:
+                # Subtle breathing glow — dim ↔ bright border
+                border_color = "rgba(99, 133, 180, 0.6)" if self._pulse_phase == 0 else "rgba(99, 133, 180, 0.2)"
+                self.bubble_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: rgba(15, 23, 42, 0.7);
+                        border: 2px solid {border_color};
+                        border-radius: {self.bubble_size//2}px;
+                        border-image: url(icon.png) 0 0 0 0 stretch;
+                    }}
+                    QPushButton:hover {{
+                        border-color: #60a5fa;
+                    }}
+                """)
+            elif self.orb_state == self.STATE_ERROR:
                 base_color = "#7f1d1d" if self._pulse_phase == 0 else "#991b1b"
                 border_color = "#ef4444" if self._pulse_phase == 0 else "#fca5a5"
                 self.bubble_btn.setStyleSheet(f"""
@@ -330,16 +345,22 @@ class ProactiveBubble(QWidget):
             data["reason"] = "Suggestion"
         if "suggestions" not in data:
             data["suggestions"] = []
+        if "screen_context" not in data:
+            data["screen_context"] = ""
+        if "error_context" not in data:
+            data["error_context"] = ""
         
         self.current_data = data
         
-        # Collapse panel on new suggestion (unless already viewing)
-        if not is_already_visible:
+        # AUTO-EXPAND for critical errors, otherwise maintain state or collapse
+        suggestion_type = data.get('type', 'general')
+        if suggestion_type == 'syntax_error' and not ("Analyzing" in data.get('reason', '')):
+            self.is_expanded = True
+            self.panel.show()
+        elif not is_already_visible:
             self.is_expanded = False
             self.panel.hide()
         
-        # Determine suggestion type
-        suggestion_type = data.get('type', 'general')
         reason = data.get('reason', 'No details')
         
         # Update Content
@@ -399,10 +420,16 @@ class ProactiveBubble(QWidget):
         if self.action_btn.parent():
             self.action_btn.setParent(None)
         
-        # Clear dynamic buttons
+        # Clear dynamic buttons (FIX 8: Qt safety guard with parent check)
         while self.dynamic_btns_layout.count():
              item = self.dynamic_btns_layout.takeAt(0)
-             if item.widget(): item.widget().deleteLater()
+             w = item.widget()
+             if w:
+                 try:
+                     if w.parent():
+                         w.deleteLater()
+                 except RuntimeError:
+                     pass  # Already deleted C++ object
         
         # Build mode-specific action chips
         if suggestion_type == 'syntax_error':
@@ -523,24 +550,30 @@ class ProactiveBubble(QWidget):
         if isinstance(code, dict): code = json.dumps(code)
         
         if action_type == "fix_error":
-            prompt = (f"SYNTAX ERROR in {error_file} at line {error_line}:\n"
-                      f"Error: {error_msg}\n\nCode:\n{error_context}\n\n"
-                      f"Suggested Fix: {reason}\n{code}\n\n"
-                      f"Please explain the fix and provide the corrected code.")
+            prompt = (f"SYNTAX ERROR DETECTED\n"
+                      f"FILE: {error_file}\n"
+                      f"LINE: {error_line}\n"
+                      f"ERROR: {error_msg}\n\n"
+                      f"CODE:\n{error_context}\n\n"
+                      f"SYSTEM FIX:\n{reason}\n{code}\n\n"
+                      f"TASK:\nExplain the fix briefly and provide final corrected code.")
             display = "Fixing Syntax Error..."
             
         elif action_type == "explain_error":
-            prompt = (f"Explain this error:\n"
-                      f"File: {error_file}, Line: {error_line}\n"
-                      f"Error: {error_msg}\n\nCode:\n{error_context}\n\n"
-                      f"Explain what went wrong and why this error occurs.")
+            prompt = (f"SYNTAX ERROR DETECTED\n"
+                      f"FILE: {error_file}\n"
+                      f"LINE: {error_line}\n"
+                      f"ERROR: {error_msg}\n\n"
+                      f"CODE:\n{error_context}\n\n"
+                      f"TASK:\nExplain what went wrong and why this error occurs.")
             display = "Explaining Error..."
             
         elif action_type == "show_code":
-            prompt = (f"Show the corrected version of this code:\n"
-                      f"File: {error_file}\n\nOriginal Code:\n{error_context}\n\n"
-                      f"Error: {error_msg}\n\n"
-                      f"Provide only the corrected code block, no explanation.")
+            prompt = (f"SYNTAX ERROR DETECTED\n"
+                      f"FILE: {error_file}\n"
+                      f"ERROR: {error_msg}\n\n"
+                      f"CODE:\n{error_context}\n\n"
+                      f"TASK:\nProvide only the corrected code block, no explanation.")
             display = "Showing Corrected Code..."
         else:
             return
@@ -552,10 +585,23 @@ class ProactiveBubble(QWidget):
     # PANEL INTERACTION
     # =====================================================================
     def show_message(self, title, message):
-        self.show_suggestion({'reason': f"{message}", 'type': 'message'})
+        self._show_suggestion_inner({'reason': f"{message}", 'type': 'message'})
         self.header_label.setText(title)
 
     def toggle_expand(self):
+        # If no suggestion data loaded yet, show a default "Ready" state
+        if not hasattr(self, 'current_data') or self.current_data is None:
+            self._show_suggestion_inner({
+                "type": "general",
+                "reason": "I'm observing your activity. Ask me anything about your current work below!",
+                "suggestions": []
+            })
+            self.header_label.setText("Cora Assistant")
+            self.is_expanded = True
+            self.panel.show()
+            self.update_layout_pos()
+            return
+            
         self.is_expanded = not self.is_expanded
         if self.is_expanded:
             self.panel.show()
@@ -578,6 +624,7 @@ class ProactiveBubble(QWidget):
         self.show()
         
     def hide_bubble(self):
+        # FIX 9: Proper state transition on hide
         self.enter_idle_mode()
 
     # =====================================================================
@@ -597,12 +644,24 @@ class ProactiveBubble(QWidget):
                  display = "Applying Writing Fix..."
             else:
                  reason = self.current_data.get('reason', '')
-                 suggs = self.current_data.get('suggestions', [])
-                 hint = suggs[0].get('hint','') if suggs else ''
-                 prompt = (f"COMMAND: Follow Suggestion\n"
-                           f"CONTEXT: {reason}\n"
-                           f"HINT: {hint}\n"
-                           f"INSTRUCTION: Provide the corrected code or text immediately.")
+                 screen_ctx = self.current_data.get('screen_context', '')
+                 file_ctx = self.current_data.get('error_context', '')
+
+                 prompt = f"""
+COMMAND: Follow Suggestion
+
+SYSTEM OBSERVATION:
+{reason}
+
+VISIBLE SCREEN CONTENT:
+{screen_ctx}
+
+CODE CONTEXT:
+{file_ctx}
+
+INSTRUCTION:
+Act directly using the provided context.
+"""
                  display = "Viewing Suggestion..."
 
             self.ask_cora_clicked.emit(display, prompt)
